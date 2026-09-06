@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const SCHEMA = "entregas";
+const SCHEMA = "public";
 
 const APPS = {
   anjun: { label: "Anjun", color: "#0F6B5C" },
