@@ -2,7 +2,15 @@ import { useState, useEffect, useMemo, useRef } from "react";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY;
 const SCHEMA = "public";
+
+// Ajuste pra sua cidade — ajuda o Geocoding a acertar endereços curtos/ambíguos.
+const CIDADE_REFERENCIA = "Macapá, AP, Brasil";
+// Usado só como centro inicial do mapa antes de haver qualquer entrega geocodificada.
+const CENTRO_PADRAO = { lat: -0.0349, lng: -51.0694 };
+// Duas entregas a até esta distância contam como "mesmo endereço" para recorrência.
+const RAIO_RECORRENCIA_METROS = 60;
 
 const APPS = {
   anjun: { label: "Anjun", color: "#0F6B5C" },
@@ -12,7 +20,7 @@ const APPS = {
 const DEFAULT_TEMPLATE =
   "Oi {nome}! Aqui e da entrega ({app}). Seu pedido esta a caminho para {endereco}. Voce vai estar disponivel pra receber?";
 
-// --- Helpers de acesso ao Supabase via REST (PostgREST), schema "entregas" ---
+// --- Helpers de acesso ao Supabase via REST (PostgREST), schema "public" ---
 async function sb(path, { method = "GET", body, extraHeaders = {} } = {}) {
   const headers = {
     apikey: SUPABASE_ANON_KEY,
@@ -84,6 +92,144 @@ function buildMapsUrl(addresses) {
   return url;
 }
 
+// --- Google Maps: geocodificação, distância e otimização de rota ---
+async function geocode(endereco, bairro) {
+  if (!GOOGLE_MAPS_API_KEY) return null;
+  const query = [endereco, bairro, CIDADE_REFERENCIA].filter(Boolean).join(", ");
+  try {
+    const res = await fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(query)}&region=br&key=${GOOGLE_MAPS_API_KEY}`
+    );
+    const data = await res.json();
+    if (data.status === "OK" && data.results && data.results[0]) {
+      const { lat, lng } = data.results[0].geometry.location;
+      return { lat, lng };
+    }
+  } catch (e) {
+    // sem coordenada não impede o cadastro da entrega
+  }
+  return null;
+}
+
+function distanceMeters(a, b) {
+  if (!a || !b || a.lat == null || a.lng == null || b.lat == null || b.lng == null) return Infinity;
+  const R = 6371000;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+let googleMapsPromise = null;
+function loadGoogleMaps() {
+  if (!GOOGLE_MAPS_API_KEY) return Promise.reject(new Error("sem chave"));
+  if (googleMapsPromise) return googleMapsPromise;
+  googleMapsPromise = new Promise((resolve, reject) => {
+    if (window.google && window.google.maps) {
+      resolve(window.google.maps);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_API_KEY}`;
+    script.async = true;
+    script.onload = () => resolve(window.google.maps);
+    script.onerror = () => reject(new Error("Falha ao carregar o Google Maps"));
+    document.head.appendChild(script);
+  });
+  return googleMapsPromise;
+}
+
+async function optimizeStopOrder(addresses) {
+  if (!GOOGLE_MAPS_API_KEY || addresses.length < 3) return addresses;
+  try {
+    const maps = await loadGoogleMaps();
+    const middle = addresses.slice(1, -1);
+    return await new Promise((resolve) => {
+      const service = new maps.DirectionsService();
+      service.route(
+        {
+          origin: addresses[0],
+          destination: addresses[addresses.length - 1],
+          waypoints: middle.map((a) => ({ location: a, stopover: true })),
+          optimizeWaypoints: true,
+          travelMode: maps.TravelMode.DRIVING,
+        },
+        (result, status) => {
+          if (status === "OK" && result.routes[0]) {
+            const ordered = result.routes[0].waypoint_order.map((i) => middle[i]);
+            resolve([addresses[0], ...ordered, addresses[addresses.length - 1]]);
+          } else {
+            resolve(addresses);
+          }
+        }
+      );
+    });
+  } catch (e) {
+    return addresses;
+  }
+}
+
+function MapaEntregas({ points, height = 240 }) {
+  const divRef = useRef(null);
+  const mapRef = useRef(null);
+  const markersRef = useRef([]);
+
+  useEffect(() => {
+    if (!GOOGLE_MAPS_API_KEY) return;
+    let cancelled = false;
+    loadGoogleMaps()
+      .then((maps) => {
+        if (cancelled || !divRef.current) return;
+        if (!mapRef.current) {
+          mapRef.current = new maps.Map(divRef.current, { center: CENTRO_PADRAO, zoom: 12 });
+        }
+        markersRef.current.forEach((m) => m.setMap(null));
+        markersRef.current = points.map(
+          (p) =>
+            new maps.Marker({
+              map: mapRef.current,
+              position: { lat: p.lat, lng: p.lng },
+              title: p.label,
+              icon: {
+                path: maps.SymbolPath.CIRCLE,
+                scale: 7,
+                fillColor: p.color,
+                fillOpacity: 1,
+                strokeWeight: 1.5,
+                strokeColor: "#fff",
+              },
+            })
+        );
+        if (points.length === 1) {
+          mapRef.current.setCenter({ lat: points[0].lat, lng: points[0].lng });
+          mapRef.current.setZoom(15);
+        } else if (points.length > 1) {
+          const bounds = new maps.LatLngBounds();
+          points.forEach((p) => bounds.extend({ lat: p.lat, lng: p.lng }));
+          mapRef.current.fitBounds(bounds);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [points]);
+
+  if (!GOOGLE_MAPS_API_KEY) {
+    return (
+      <div style={{ ...styles.emptyState, marginBottom: 12 }}>
+        Configure VITE_GOOGLE_MAPS_API_KEY para ver o mapa com os marcadores das entregas.
+      </div>
+    );
+  }
+  if (points.length === 0) {
+    return <div style={{ ...styles.emptyState, marginBottom: 12 }}>Nenhuma entrega com coordenada pra mostrar aqui ainda.</div>;
+  }
+  return <div ref={divRef} style={{ width: "100%", height, borderRadius: 12, border: "1px solid #E4DFD4", marginBottom: 12 }} />;
+}
+
 export default function RotaEntregas() {
   const [pending, setPending] = useState([]);
   const [history, setHistory] = useState([]);
@@ -100,7 +246,19 @@ export default function RotaEntregas() {
   const [extracting, setExtracting] = useState(false);
   const [extractError, setExtractError] = useState("");
   const [draft, setDraft] = useState([]);
+  const [optimizing, setOptimizing] = useState(false);
   const fileInputRef = useRef(null);
+
+  async function openOptimizedRoute(addresses) {
+    setOptimizing(true);
+    try {
+      const ordered = await optimizeStopOrder(addresses);
+      const url = buildMapsUrl(ordered);
+      if (url) window.open(url, "_blank", "noopener");
+    } finally {
+      setOptimizing(false);
+    }
+  }
 
   async function loadAll() {
     setLoadError("");
@@ -111,10 +269,10 @@ export default function RotaEntregas() {
         sb("settings?select=*&chave=eq.whatsapp_template"),
       ]);
       setPending(
-        (pacotes || []).map((p) => ({ id: p.id, nome: p.nome, whatsapp: p.whatsapp, endereco: p.endereco, bairro: p.bairro, app: p.app, createdAt: p.created_at }))
+        (pacotes || []).map((p) => ({ id: p.id, nome: p.nome, whatsapp: p.whatsapp, endereco: p.endereco, bairro: p.bairro, app: p.app, lat: p.lat, lng: p.lng, createdAt: p.created_at }))
       );
       setHistory(
-        (historico || []).map((h) => ({ id: h.id, nome: h.nome, whatsapp: h.whatsapp, endereco: h.endereco, bairro: h.bairro, app: h.app, deliveredAt: h.delivered_at }))
+        (historico || []).map((h) => ({ id: h.id, nome: h.nome, whatsapp: h.whatsapp, endereco: h.endereco, bairro: h.bairro, app: h.app, lat: h.lat, lng: h.lng, deliveredAt: h.delivered_at }))
       );
       if (settings && settings.length > 0) {
         setTemplate(settings[0].valor);
@@ -140,19 +298,33 @@ export default function RotaEntregas() {
     return map;
   }, [history]);
 
-  function repeatInfo(endereco) {
+  function repeatInfoByText(endereco) {
     return historyIndex[normalize(endereco)] || [];
+  }
+
+  function repeatInfoForItem(item) {
+    const byText = repeatInfoByText(item.endereco);
+    if (item.lat == null || item.lng == null) return byText;
+    const byProx = history.filter((h) => distanceMeters(item, h) <= RAIO_RECORRENCIA_METROS);
+    const merged = [...byProx];
+    byText.forEach((h) => {
+      if (!merged.some((m) => m.id === h.id)) merged.push(h);
+    });
+    return merged;
   }
 
   async function addDelivery() {
     if (!form.endereco.trim() || !form.bairro.trim()) return;
     setSaveError("");
+    const coords = await geocode(form.endereco.trim(), form.bairro.trim());
     const payload = {
       nome: form.nome.trim(),
       whatsapp: form.whatsapp.trim(),
       endereco: form.endereco.trim(),
       bairro: form.bairro.trim(),
       app: form.app,
+      lat: coords ? coords.lat : null,
+      lng: coords ? coords.lng : null,
     };
     try {
       const [inserted] = await sb("pacotes", { method: "POST", body: [payload], extraHeaders: { Prefer: "return=representation" } });
@@ -170,12 +342,12 @@ export default function RotaEntregas() {
     try {
       const [inserted] = await sb("historico", {
         method: "POST",
-        body: [{ nome: item.nome, whatsapp: item.whatsapp, endereco: item.endereco, bairro: item.bairro, app: item.app }],
+        body: [{ nome: item.nome, whatsapp: item.whatsapp, endereco: item.endereco, bairro: item.bairro, app: item.app, lat: item.lat, lng: item.lng }],
         extraHeaders: { Prefer: "return=representation" },
       });
       await sb(`pacotes?id=eq.${item.id}`, { method: "DELETE" });
       setPending(pending.filter((p) => p.id !== id));
-      setHistory([{ id: inserted.id, nome: item.nome, whatsapp: item.whatsapp, endereco: item.endereco, bairro: item.bairro, app: item.app, deliveredAt: inserted.delivered_at }, ...history]);
+      setHistory([{ id: inserted.id, nome: item.nome, whatsapp: item.whatsapp, endereco: item.endereco, bairro: item.bairro, app: item.app, lat: item.lat, lng: item.lng, deliveredAt: inserted.delivered_at }, ...history]);
     } catch (e) {
       setSaveError("Não consegui marcar como entregue agora. Tente de novo.");
     }
@@ -258,15 +430,22 @@ export default function RotaEntregas() {
     if (selected.length === 0) return;
     setSaveError("");
     try {
-      const payload = selected.map((d) => ({
-        nome: d.nome.trim(),
-        whatsapp: d.whatsapp.trim(),
-        endereco: d.endereco.trim(),
-        bairro: d.bairro.trim() || "Sem bairro",
-        app: d.app,
-      }));
+      const payload = await Promise.all(
+        selected.map(async (d) => {
+          const coords = await geocode(d.endereco.trim(), d.bairro.trim());
+          return {
+            nome: d.nome.trim(),
+            whatsapp: d.whatsapp.trim(),
+            endereco: d.endereco.trim(),
+            bairro: d.bairro.trim() || "Sem bairro",
+            app: d.app,
+            lat: coords ? coords.lat : null,
+            lng: coords ? coords.lng : null,
+          };
+        })
+      );
       const inserted = await sb("pacotes", { method: "POST", body: payload, extraHeaders: { Prefer: "return=representation" } });
-      setPending([...pending, ...inserted.map((row) => ({ id: row.id, nome: row.nome, whatsapp: row.whatsapp, endereco: row.endereco, bairro: row.bairro, app: row.app, createdAt: row.created_at }))]);
+      setPending([...pending, ...inserted.map((row) => ({ id: row.id, nome: row.nome, whatsapp: row.whatsapp, endereco: row.endereco, bairro: row.bairro, app: row.app, lat: row.lat, lng: row.lng, createdAt: row.created_at }))]);
       setDraft([]);
       setFile(null);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -434,10 +613,10 @@ export default function RotaEntregas() {
             <input style={s.input} value={form.bairro} onChange={(e) => setForm({ ...form, bairro: e.target.value })} placeholder="Ex: Jesus de Nazaré" />
           </div>
 
-          {form.endereco.trim() && repeatInfo(form.endereco).length > 0 && (
+          {form.endereco.trim() && repeatInfoByText(form.endereco).length > 0 && (
             <div style={s.repeatNotice}>
-              Já entregou nesse endereço {repeatInfo(form.endereco).length}x antes
-              {repeatInfo(form.endereco)[0].nome ? ` (${repeatInfo(form.endereco)[0].nome})` : ""}.
+              Já entregou nesse endereço {repeatInfoByText(form.endereco).length}x antes
+              {repeatInfoByText(form.endereco)[0].nome ? ` (${repeatInfoByText(form.endereco)[0].nome})` : ""}.
             </div>
           )}
 
@@ -456,10 +635,20 @@ export default function RotaEntregas() {
           </div>
 
           {allPendingAddresses.length > 1 && (
-            <a style={s.mapButtonWide} href={buildMapsUrl(allPendingAddresses)} target="_blank" rel="noreferrer">
-              Abrir rota completa no Google Maps ({allPendingAddresses.length} paradas)
-            </a>
+            <button
+              style={{ ...s.mapButtonWide, border: "none", width: "100%" }}
+              disabled={optimizing}
+              onClick={() => openOptimizedRoute(allPendingAddresses)}
+            >
+              {optimizing ? "Otimizando rota..." : `Abrir rota completa no Google Maps (${allPendingAddresses.length} paradas)`}
+            </button>
           )}
+
+          <MapaEntregas
+            points={pending
+              .filter((p) => p.lat != null && p.lng != null)
+              .map((p) => ({ lat: p.lat, lng: p.lng, label: p.endereco, color: APPS[p.app].color }))}
+          />
 
           <div style={s.list}>
             {grouped.length === 0 && (
@@ -473,9 +662,13 @@ export default function RotaEntregas() {
                 </div>
 
                 {items.length > 1 && (
-                  <a style={s.mapButtonSmall} href={buildMapsUrl(items.map((i) => i.endereco))} target="_blank" rel="noreferrer">
-                    Abrir rota deste bairro no Maps
-                  </a>
+                  <button
+                    style={{ ...s.mapButtonSmall, background: "none", border: "none", padding: 0, cursor: "pointer" }}
+                    disabled={optimizing}
+                    onClick={() => openOptimizedRoute(items.map((i) => i.endereco))}
+                  >
+                    {optimizing ? "Otimizando rota..." : "Abrir rota deste bairro no Maps"}
+                  </button>
                 )}
 
                 {items.map((item) => (
@@ -486,7 +679,7 @@ export default function RotaEntregas() {
                         {item.nome && <span style={s.deliveryName}>{item.nome}</span>}
                       </div>
                       <div style={s.deliveryAddress}>{item.endereco}</div>
-                      {repeatInfo(item.endereco).length > 0 && <div style={s.repeatTag}>já entregou aqui {repeatInfo(item.endereco).length}x</div>}
+                      {repeatInfoForItem(item).length > 0 && <div style={s.repeatTag}>já entregou aqui {repeatInfoForItem(item).length}x</div>}
                     </div>
                     <div style={s.deliveryActions}>
                       <a style={s.iconLink} href={`https://maps.google.com/?q=${encodeURIComponent(item.endereco)}`} target="_blank" rel="noreferrer">
@@ -515,6 +708,13 @@ export default function RotaEntregas() {
       {loaded && tab === "historico" && (
         <div>
           <input style={{ ...s.input, marginBottom: 12 }} placeholder="Buscar por nome, endereço ou bairro" value={search} onChange={(e) => setSearch(e.target.value)} />
+
+          <MapaEntregas
+            points={filteredHistory
+              .filter((h) => h.lat != null && h.lng != null)
+              .map((h) => ({ lat: h.lat, lng: h.lng, label: h.endereco, color: APPS[h.app].color }))}
+          />
+
           <div style={s.list}>
             {filteredHistory.length === 0 && (
               <div style={s.emptyState}>
