@@ -81,6 +81,12 @@ function fillTemplate(template, item) {
     .replace(/\{app\}/g, APPS[item.app] ? APPS[item.app].label : item.app || "");
 }
 
+function locationString(item) {
+  if (!item) return "";
+  if (item.lat != null && item.lng != null) return `${item.lat},${item.lng}`;
+  return item.endereco || "";
+}
+
 function buildMapsUrl(addresses) {
   const list = addresses.filter(Boolean);
   if (list.length === 0) return null;
@@ -465,7 +471,7 @@ export default function RotaEntregas() {
     return Object.entries(map).sort((a, b) => a[0].localeCompare(b[0]));
   }, [pending]);
 
-  const allPendingAddresses = useMemo(() => grouped.flatMap(([, items]) => items.map((i) => i.endereco)), [grouped]);
+  const allPendingStops = useMemo(() => grouped.flatMap(([, items]) => items.map((i) => locationString(i))), [grouped]);
 
   const filteredHistory = useMemo(() => {
     const q = normalize(search);
@@ -634,13 +640,13 @@ export default function RotaEntregas() {
             <div style={s.helperTextSmall}>Use {"{nome}"}, {"{endereco}"} e {"{app}"} — são preenchidos automaticamente.</div>
           </div>
 
-          {allPendingAddresses.length > 1 && (
+          {allPendingStops.length > 1 && (
             <button
               style={{ ...s.mapButtonWide, border: "none", width: "100%" }}
               disabled={optimizing}
-              onClick={() => openOptimizedRoute(allPendingAddresses)}
+              onClick={() => openOptimizedRoute(allPendingStops)}
             >
-              {optimizing ? "Otimizando rota..." : `Abrir rota completa no Google Maps (${allPendingAddresses.length} paradas)`}
+              {optimizing ? "Otimizando rota..." : `Abrir rota completa no Google Maps (${allPendingStops.length} paradas)`}
             </button>
           )}
 
@@ -665,7 +671,7 @@ export default function RotaEntregas() {
                   <button
                     style={{ ...s.mapButtonSmall, background: "none", border: "none", padding: 0, cursor: "pointer" }}
                     disabled={optimizing}
-                    onClick={() => openOptimizedRoute(items.map((i) => i.endereco))}
+                    onClick={() => openOptimizedRoute(items.map((i) => locationString(i)))}
                   >
                     {optimizing ? "Otimizando rota..." : "Abrir rota deste bairro no Maps"}
                   </button>
@@ -682,7 +688,12 @@ export default function RotaEntregas() {
                       {repeatInfoForItem(item).length > 0 && <div style={s.repeatTag}>já entregou aqui {repeatInfoForItem(item).length}x</div>}
                     </div>
                     <div style={s.deliveryActions}>
-                      <a style={s.iconLink} href={`https://maps.google.com/?q=${encodeURIComponent(item.endereco)}`} target="_blank" rel="noreferrer">
+                      <a
+                        style={s.iconLink}
+                        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(locationString(item))}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
                         Ver no Maps
                       </a>
                       {cleanPhone(item.whatsapp) && (
